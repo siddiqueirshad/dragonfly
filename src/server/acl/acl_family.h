@@ -7,7 +7,10 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
@@ -78,27 +81,25 @@ class AclFamily final {
   // Serializes the whole registry into a string
   std::string RegistryToString() const;
 
-  std::string AclCatToString(uint32_t acl_category, User::Sign sign) const;
+  // Serializes the user to a rule line. The ACL file format has upper-case keywords and full
+  // password hashes, the ACL LIST format lower-case keywords and truncated hashes.
+  std::string UserToString(std::string_view username, const User& user, bool file_format) const;
 
-  std::string AclCommandToString(size_t family, uint64_t mask, User::Sign sign) const;
+  // Serializes the user's category and command rules in the order they were applied.
+  std::string CommandRulesToString(const User& user) const;
 
-  // Serializes category and command to string
-  std::string AclCatAndCommandToString(const User::CategoryChanges& cat,
-                                       const User::CommandChanges& cmds) const;
-
-  using OptCat = std::optional<uint32_t>;
-  std::pair<OptCat, bool> MaybeParseAclCategory(std::string_view command) const;
-
-  using OptCommand = std::optional<std::pair<size_t, uint64_t>>;
-  std::pair<OptCommand, bool> MaybeParseAclCommand(std::string_view command) const;
-
-  std::optional<std::string> MaybeParseNamespace(std::string_view command) const;
+  std::string CommandRuleToString(User::CommandChange cmd, User::Sign sign) const;
 
   User::UpdateRequest::CategoryValueType CategoryRule(User::Sign sign, uint32_t category) const;
 
-  std::variant<User::UpdateRequest, facade::ErrorReply> ParseAclSetUser(
-      facade::ParsedArgs args, bool hashed = false, bool has_all_keys = false,
-      bool has_all_channels = false) const;
+  std::optional<User::UpdateRequest::CommandsValueType> ParseCommandRule(
+      std::string_view rule) const;
+
+  // `hashed` accepts #<hash> passwords, as written to the ACL file. `has_all_keys` is whether the
+  // updated user can already access all keys.
+  std::variant<User::UpdateRequest, facade::ErrorReply> ParseAclSetUser(facade::ParsedArgs args,
+                                                                        bool hashed,
+                                                                        bool has_all_keys) const;
 
   void BuildIndexers(RevCommandsIndexStore families);
 

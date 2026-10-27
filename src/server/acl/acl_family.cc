@@ -20,11 +20,14 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/flags/commandlineflag.h"
 #include "absl/numeric/bits.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/escaping.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
+#include "absl/strings/strip.h"
 #include "base/flags.h"
 #include "base/logging.h"
 #include "core/overloaded.h"
@@ -57,21 +60,20 @@ namespace dfly::acl {
 
 namespace {
 
-string PasswordsToString(const absl::flat_hash_set<string>& passwords, bool nopass, bool full_sha);
 using MaterializedContents = optional<vector<vector<string_view>>>;
 
 MaterializedContents MaterializeFileContents(vector<string>* usernames, string_view file_contents);
 
-string AclKeysToString(const AclKeys& keys);
-
-string AclPubSubToString(const AclPubSub& pub_sub);
-
 void SendAclSecurityEvents(const AclLog::LogEntry& entry, facade::RedisReplyBuilder* rb);
-
-string AclDbToString(size_t db);
 
 template <typename P>
 void TraverseEvictImpl(P predicate, facade::Listener* main_listener, util::ProactorPool* pool);
+
+using Sign = User::Sign;
+
+string_view SignPrefix(Sign sign) {
+  return sign == Sign::PLUS ? "+" : "-";
+}
 
 // Returns the mask of an upper-case category name.
 optional<uint32_t> ParseCategoryName(string_view name) {
@@ -87,6 +89,136 @@ optional<uint32_t> ParseCategoryName(string_view name) {
     return nullopt;
   return 1u << (it - kCategoryNames.begin());
 }
+
+// Parses ALLCOMMANDS, NOCOMMANDS, +@<category> and -@<category>, given in upper case.
+optional<pair<Sign, uint32_t>> ParseCategoryRule(string_view rule) {
+  if (rule == "ALLCOMMANDS")
+    return pair{Sign::PLUS, ALL};
+  if (rule == "NOCOMMANDS")
+    return pair{Sign::MINUS, ALL};
+
+  if (rule.size() < 2 || rule[1] != '@' || (rule[0] != '+' && rule[0] != '-'))
+    return nullopt;
+
+  auto category = ParseCategoryName(rule.substr(2));
+  if (!category)
+    return nullopt;
+  return pair{rule[0] == '+' ? Sign::PLUS : Sign::MINUS, *category};
+}
+
+// `hashed` accepts #<hash>, the form the ACL file stores passwords in.
+optional<User::UpdatePass> ParsePasswordRule(string_view rule, bool hashed) {
+  if (rule == "nopass")
+    return User::UpdatePass{.password = {}, .nopass = true};
+  if (rule == "resetpass")
+    return User::UpdatePass{.password = {}, .reset_password = true};
+
+  if (absl::ConsumePrefix(&rule, ">"))
+    return User::UpdatePass{.password = string(rule)};
+  if (hashed && absl::ConsumePrefix(&rule, "#"))
+    return User::UpdatePass{.password = string(rule), .is_hashed = true};
+  if (absl::ConsumePrefix(&rule, "<"))
+    return User::UpdatePass{.password = string(rule), .unset = true};
+
+  return nullopt;
+}
+
+optional<User::UpdateKey> ParseKeyRule(string_view rule) {
+  if (absl::EqualsIgnoreCase(rule, "ALLKEYS") || rule == "~*")
+    return User::UpdateKey{.key = {}, .op = KeyOp::READ_WRITE, .all_keys = true};
+  if (absl::EqualsIgnoreCase(rule, "RESETKEYS"))
+    return User::UpdateKey{.key = {}, .op = KeyOp::READ_WRITE, .reset_keys = true};
+
+  KeyOp op = KeyOp::READ_WRITE;
+  if (absl::ConsumePrefix(&rule, "%RW")) {
+    op = KeyOp::READ_WRITE;
+  } else if (absl::ConsumePrefix(&rule, "%R")) {
+    op = KeyOp::READ;
+  } else if (absl::ConsumePrefix(&rule, "%W")) {
+    op = KeyOp::WRITE;
+  }
+
+  if (!absl::ConsumePrefix(&rule, "~") || rule.empty())
+    return nullopt;
+  return User::UpdateKey{.key = string(rule), .op = op};
+}
+
+optional<User::UpdatePubSub> ParseChannelRule(string_view rule) {
+  if (absl::EqualsIgnoreCase(rule, "ALLCHANNELS") || rule == "&*")
+    return User::UpdatePubSub{.pattern = {}, .all_channels = true};
+  if (absl::EqualsIgnoreCase(rule, "RESETCHANNELS"))
+    return User::UpdatePubSub{.pattern = {}, .reset_channels = true};
+
+  if (!absl::ConsumePrefix(&rule, "&") || rule.empty())
+    return nullopt;
+  return User::UpdatePubSub{.pattern = string(rule),
+                            .has_asterisk = rule.find('*') != string_view::npos};
+}
+
+// Parses $<db> and $all.
+optional<size_t> ParseDbRule(string_view rule, uint32_t dbnum) {
+  if (!absl::ConsumePrefix(&rule, "$"))
+    return nullopt;
+  if (absl::EqualsIgnoreCase(rule, "ALL"))
+    return kAllDbs;
+
+  size_t db = 0;
+  if (absl::SimpleAtoi(rule, &db) && db < dbnum)
+    return db;
+  return nullopt;
+}
+
+optional<bool> ParseStatusRule(string_view rule) {
+  if (rule == "ON")
+    return true;
+  if (rule == "OFF")
+    return false;
+  return nullopt;
+}
+
+// Hashes are truncated unless `full_hash`, which the ACL file needs to restore the passwords.
+string PasswordsToString(const User& user, bool full_hash) {
+  if (user.HasNopass())
+    return "nopass ";
+
+  string result;
+  for (const auto& hash : user.Passwords()) {
+    const string hex = absl::BytesToHexString(hash);
+    absl::StrAppend(&result, "#", full_hash ? hex : hex.substr(0, 15), " ");
+  }
+  return result;
+}
+
+string KeysToString(const AclKeys& keys) {
+  if (keys.all_keys)
+    return "~*";
+
+  return absl::StrJoin(keys.key_globs, " ", [](string* out, const GlobType& glob) {
+    const auto& [pattern, op] = glob;
+    string_view prefix = op == KeyOp::READ_WRITE ? "" : (op == KeyOp::READ ? "%R" : "%W");
+    absl::StrAppend(out, prefix, "~", pattern);
+  });
+}
+
+string ChannelsToString(const AclPubSub& pub_sub) {
+  if (pub_sub.all_channels)
+    return "&*";
+
+  string result = "resetchannels";
+  for (const auto& [glob, _] : pub_sub.globs)
+    absl::StrAppend(&result, " &", glob);
+  return result;
+}
+
+string DbToString(size_t db) {
+  return db == kAllDbs ? "all" : absl::StrCat(db);
+}
+
+string CategoryRuleToString(uint32_t category, Sign sign) {
+  string_view name = category == ALL ? "all" : kCategoryNames[absl::countr_zero(category)];
+  return absl::StrCat(SignPrefix(sign), "@", absl::AsciiStrToLower(name));
+}
+
 }  // namespace
 
 AclFamily::AclFamily(UserRegistry* registry, util::ProactorPool* pool)
@@ -99,34 +231,11 @@ void AclFamily::Acl(CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 void AclFamily::List(CmdArgParser parser, CommandContext* cmd_cntx) {
-  const auto registry_with_lock = registry_->GetRegistryWithLock();
-  const auto& registry = registry_with_lock.registry;
+  const auto reg = registry_->GetRegistryWithLock();
   auto* rb = static_cast<facade::RedisReplyBuilder*>(cmd_cntx->rb());
-  rb->StartArray(registry.size());
-
-  for (const auto& [username, user] : registry) {
-    string buffer = "user ";
-    const string password = PasswordsToString(user.Passwords(), user.HasNopass(), false);
-
-    const string acl_keys = AclKeysToString(user.Keys());
-
-    const string acl_pub_sub = AclPubSubToString(user.PubSub());
-
-    const string maybe_space_com = acl_keys.empty() ? "" : " ";
-
-    const string acl_cat_and_commands =
-        AclCatAndCommandToString(user.CatChanges(), user.CmdChanges());
-
-    const string db_index = AclDbToString(user.Db());
-
-    using namespace string_view_literals;
-
-    absl::StrAppend(&buffer, username, " ", user.IsActive() ? "on "sv : "off "sv, password,
-                    acl_keys, maybe_space_com, acl_pub_sub, " ", acl_cat_and_commands, " $",
-                    db_index);
-
-    rb->SendSimpleString(buffer);
-  }
+  rb->StartArray(reg.registry.size());
+  for (const auto& [username, user] : reg.registry)
+    rb->SendSimpleString(UserToString(username, user, false));
 }
 
 void AclFamily::StreamUpdatesToAllProactorConnections(const std::string& user,
@@ -241,31 +350,10 @@ void AclFamily::WhoAmI(CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 string AclFamily::RegistryToString() const {
-  auto registry_with_read_lock = registry_->GetRegistryWithLock();
-  auto& registry = registry_with_read_lock.registry;
+  const auto reg = registry_->GetRegistryWithLock();
   string result;
-  for (auto& [username, user] : registry) {
-    string command = "USER ";
-    const string password = PasswordsToString(user.Passwords(), user.HasNopass(), true);
-
-    const string acl_keys = AclKeysToString(user.Keys());
-
-    const string maybe_space = acl_keys.empty() ? "" : " ";
-
-    const string acl_pub_sub = AclPubSubToString(user.PubSub());
-
-    const string acl_cat_and_commands =
-        AclCatAndCommandToString(user.CatChanges(), user.CmdChanges());
-
-    const string db_index = AclDbToString(user.Db());
-
-    using namespace string_view_literals;
-
-    absl::StrAppend(&result, command, username, " ", user.IsActive() ? "ON "sv : "OFF "sv, password,
-                    acl_keys, maybe_space, acl_pub_sub, " ", acl_cat_and_commands, " $", db_index,
-                    "\n");
-  }
-
+  for (const auto& [username, user] : reg.registry)
+    absl::StrAppend(&result, UserToString(username, user, true), "\n");
   return result;
 }
 
@@ -336,7 +424,7 @@ GenericError AclFamily::LoadToRegistryFromFile(std::string_view full_path,
   std::vector<User::UpdateRequest> requests;
 
   for (auto& cmds : *materialized) {
-    auto req = ParseAclSetUser(facade::ParsedArgs{cmds}, true);
+    auto req = ParseAclSetUser(facade::ParsedArgs{cmds}, true, false);
     if (std::holds_alternative<ErrorReply>(req)) {
       auto error = std::move(std::get<ErrorReply>(req));
       LOG(WARNING) << "Error while parsing aclfile: " << error.ToSv();
@@ -505,56 +593,42 @@ void AclFamily::Cat(CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 void AclFamily::GetUser(CmdArgParser parser, CommandContext* cmd_cntx) {
-  auto username = parser.Next();
-  const auto registry_with_lock = registry_->GetRegistryWithLock();
-  const auto& registry = registry_with_lock.registry;
+  string_view username = parser.Next();
+  const auto reg = registry_->GetRegistryWithLock();
   auto* rb = static_cast<facade::RedisReplyBuilder*>(cmd_cntx->rb());
+  auto it = reg.registry.find(username);
+  if (it == reg.registry.end())
+    return rb->SendNull();
 
-  if (!registry.contains(username)) {
-    rb->SendNull();
-    return;
-  }
-  auto& user = registry.find(username)->second;
-  std::string status = user.IsActive() ? "on" : "off";
-  auto pass = PasswordsToString(user.Passwords(), user.HasNopass(), false);
-  if (!pass.empty()) {
-    pass.pop_back();
-  }
-
+  const User& user = it->second;
   rb->StartArray(10);
 
   rb->SendSimpleString("flags");
-  const size_t total_elements = (pass != "nopass") ? 1 : 2;
-  rb->StartArray(total_elements);
-  rb->SendSimpleString(status);
-  if (total_elements == 2) {
-    rb->SendSimpleString(pass);
-  }
+  vector<string_view> flags = {user.IsActive() ? "on" : "off"};
+  if (user.HasNopass())
+    flags.push_back("nopass");
+  rb->SendSimpleStrArr(flags);
 
   rb->SendSimpleString("passwords");
-  if (pass != "nopass" && !pass.empty()) {
-    rb->SendSimpleString(pass);
-  } else {
+  if (user.HasNopass() || user.Passwords().empty()) {
     rb->SendEmptyArray();
+  } else {
+    string passwords = PasswordsToString(user, false);
+    passwords.pop_back();
+    rb->SendSimpleString(passwords);
   }
+
   rb->SendSimpleString("commands");
-
-  const std::string acl_cat_and_commands =
-      AclCatAndCommandToString(user.CatChanges(), user.CmdChanges());
-
-  rb->SendSimpleString(acl_cat_and_commands);
+  rb->SendSimpleString(CommandRulesToString(user));
 
   rb->SendSimpleString("keys");
-  std::string keys = AclKeysToString(user.Keys());
-  if (!keys.empty()) {
-    rb->SendSimpleString(keys);
-  } else {
+  if (string keys = KeysToString(user.Keys()); keys.empty())
     rb->SendEmptyArray();
-  }
+  else
+    rb->SendSimpleString(keys);
 
   rb->SendSimpleString("channels");
-  std::string pub_sub = AclPubSubToString(user.PubSub());
-  rb->SendSimpleString(pub_sub);
+  rb->SendSimpleString(ChannelsToString(user.PubSub()));
 }
 
 void AclFamily::GenPass(CmdArgParser parser, CommandContext* cmd_cntx) {
@@ -653,67 +727,7 @@ void AclFamily::Init(facade::Listener* main_listener) {
   registry_->Init();
 }
 
-std::string AclFamily::AclCatToString(uint32_t acl_category, User::Sign sign) const {
-  std::string res = sign == User::Sign::PLUS ? "+@" : "-@";
-  if (acl_category == acl::ALL) {
-    absl::StrAppend(&res, "all");
-    return res;
-  }
-
-  absl::StrAppend(&res, absl::AsciiStrToLower(kCategoryNames[absl::countr_zero(acl_category)]));
-  return res;
-}
-
-std::string AclFamily::AclCommandToString(size_t family, uint64_t mask, User::Sign sign) const {
-  const auto& rev_index = family_commands_;
-  std::string res;
-  std::string prefix = (sign == User::Sign::PLUS) ? "+" : "-";
-  if (mask == ALL_COMMANDS) {
-    for (const auto& cmd : rev_index[family]) {
-      absl::StrAppend(&res, prefix, absl::AsciiStrToLower(cmd), " ");
-    }
-    res.pop_back();
-    return res;
-  }
-
-  // A +name rule also sets the bits of name's ACL-only subcommands, registered after name.
-  std::string name = absl::AsciiStrToLower(rev_index[family][absl::countr_zero(mask)]);
-  std::replace(name.begin(), name.end(), ' ', '|');  // one token in the ACL file
-  absl::StrAppend(&res, prefix, name);
-  return res;
-}
-
 namespace {
-struct CategoryAndMetadata {
-  User::CategoryChange change;
-  User::ChangeMetadata metadata;
-};
-
-struct CommandAndMetadata {
-  User::CommandChange change;
-  User::ChangeMetadata metadata;
-};
-
-using MergeResult = std::vector<std::variant<CategoryAndMetadata, CommandAndMetadata>>;
-
-MergeResult MergeTables(const User::CategoryChanges& categories,
-                        const User::CommandChanges& commands) {
-  MergeResult result;
-  for (auto [cat, meta] : categories) {
-    result.push_back(CategoryAndMetadata{cat, meta});
-  }
-
-  for (auto [cmd, meta] : commands) {
-    result.push_back(CommandAndMetadata{cmd, meta});
-  }
-
-  rng::sort(result, [](const auto& l, const auto& r) {
-    auto fetch = [](const auto& l) { return l.metadata.seq_no; };
-    return std::visit(fetch, l) < std::visit(fetch, r);
-  });
-
-  return result;
-}
 
 using MaterializedContents = std::optional<std::vector<std::vector<std::string_view>>>;
 
@@ -738,176 +752,6 @@ MaterializedContents MaterializeFileContents(std::vector<std::string>* usernames
     materialized.push_back(cmds);
   }
   return materialized;
-}
-
-struct ParseKeyResult {
-  std::string glob;
-  KeyOp op;
-  bool all_keys{false};
-  bool reset_keys{false};
-};
-
-std::optional<ParseKeyResult> MaybeParseAclKey(std::string_view command) {
-  if (absl::EqualsIgnoreCase(command, "ALLKEYS") || command == "~*") {
-    return ParseKeyResult{"", {}, true};
-  }
-
-  if (absl::EqualsIgnoreCase(command, "RESETKEYS")) {
-    return ParseKeyResult{"", {}, false, true};
-  }
-
-  auto op = KeyOp::READ_WRITE;
-
-  if (absl::StartsWith(command, "%RW")) {
-    command = command.substr(3);
-  } else if (absl::StartsWith(command, "%R")) {
-    op = KeyOp::READ;
-    command = command.substr(2);
-  } else if (absl::StartsWith(command, "%W")) {
-    op = KeyOp::WRITE;
-    command = command.substr(2);
-  }
-
-  if (!absl::StartsWith(command, "~")) {
-    return {};
-  }
-
-  auto key = command.substr(1);
-  if (key.empty()) {
-    return {};
-  }
-  return ParseKeyResult{std::string(key), op};
-}
-
-struct ParsePubSubResult {
-  std::string glob;
-  bool has_asterisk{false};
-  bool all_channels{false};
-  bool reset_channels{false};
-};
-
-std::optional<ParsePubSubResult> MaybeParseAclPubSub(std::string_view command) {
-  if (absl::EqualsIgnoreCase(command, "ALLCHANNELS") || command == "&*") {
-    return ParsePubSubResult{"", false, true, false};
-  }
-
-  if (absl::EqualsIgnoreCase(command, "RESETCHANNELS")) {
-    return ParsePubSubResult{"", false, false, true};
-  }
-
-  if (absl::StartsWith(command, "&") && command.size() >= 2) {
-    const auto glob = command.substr(1);
-    const bool has_asterisk = glob.find('*') != std::string_view::npos;
-    return ParsePubSubResult{std::string(glob), has_asterisk};
-  }
-
-  return {};
-}
-
-std::optional<size_t> MaybeParseAclDflySelect(std::string_view command, uint32_t dbnum) {
-  if (!absl::StartsWith(command, "$")) {
-    return std::nullopt;
-  }
-
-  size_t res = 0;
-  if (absl::SimpleAtoi(command.substr(1), &res) && res < dbnum) {
-    return {res};
-  }
-
-  if (absl::EqualsIgnoreCase(command.substr(1), "ALL")) {
-    return {std::numeric_limits<size_t>::max()};
-  }
-
-  return std::nullopt;
-}
-
-std::string PrettyPrintSha(std::string_view pass, bool all) {
-  if (all) {
-    return absl::BytesToHexString(pass);
-  }
-  return absl::BytesToHexString(pass.substr(0, 15)).substr(0, 15);
-};
-
-std::optional<User::UpdatePass> MaybeParsePassword(std::string_view command, bool hashed) {
-  using UpPass = User::UpdatePass;
-  if (command == "nopass") {
-    return UpPass{"", false, true};
-  }
-
-  if (command == "resetpass") {
-    return UpPass{"", false, false, true};
-  }
-
-  if (command[0] == '>' || (hashed && command[0] == '#')) {
-    return UpPass{std::string(command.substr(1))};
-  }
-
-  if (command[0] == '<') {
-    return UpPass{std::string(command.substr(1)), true};
-  }
-
-  return {};
-}
-
-std::optional<bool> MaybeParseStatus(std::string_view command) {
-  if (command == "ON") {
-    return true;
-  }
-  if (command == "OFF") {
-    return false;
-  }
-  return {};
-}
-
-std::string PasswordsToString(const absl::flat_hash_set<std::string>& passwords, bool nopass,
-                              bool full_sha) {
-  if (nopass) {
-    return "nopass ";
-  }
-  std::string result;
-  for (const auto& pass : passwords) {
-    absl::StrAppend(&result, "#", PrettyPrintSha(pass, full_sha), " ");
-  }
-
-  return result;
-}
-
-std::string AclKeysToString(const AclKeys& keys) {
-  if (keys.all_keys) {
-    return "~*";
-  }
-  std::string result;
-  for (auto& [pattern, op] : keys.key_globs) {
-    if (op == KeyOp::READ_WRITE) {
-      absl::StrAppend(&result, "~", pattern, " ");
-      continue;
-    }
-    std::string op_str = (op == KeyOp::READ) ? "R" : "W";
-    absl::StrAppend(&result, "%", op_str, "~", pattern, " ");
-  }
-
-  if (!result.empty()) {
-    result.pop_back();
-  }
-  return result;
-}
-
-std::string AclPubSubToString(const AclPubSub& pub_sub) {
-  if (pub_sub.all_channels) {
-    return "&*";
-  }
-
-  std::string result = "resetchannels ";
-
-  for (const auto& [glob, has_asterisk] : pub_sub.globs) {
-    absl::StrAppend(&result, "&", glob, " ");
-  }
-
-  if (result.back() == ' ') {
-    result.pop_back();
-  }
-
-  return result;
 }
 
 void SendAclSecurityEvents(const AclLog::LogEntry& entry, facade::RedisReplyBuilder* rb) {
@@ -943,10 +787,6 @@ void SendAclSecurityEvents(const AclLog::LogEntry& entry, facade::RedisReplyBuil
   rb->SendLong(entry.entry_creation.time_since_epoch().count());
 }
 
-std::string AclDbToString(size_t db) {
-  return std::numeric_limits<size_t>::max() == db ? "all" : absl::StrCat(db);
-}
-
 // Fetches the connections that predicate P evaluates to true and shuts them
 // down gracefully.
 template <typename P>
@@ -977,125 +817,73 @@ void TraverseEvictImpl(P predicate, facade::Listener* main_listener, util::Proac
 
 }  // namespace
 
-std::string AclFamily::AclCatAndCommandToString(const User::CategoryChanges& cat,
-                                                const User::CommandChanges& cmds) const {
-  std::string result;
-
-  auto tables = MergeTables(cat, cmds);
-
-  auto cat_visitor = [&result, this](const CategoryAndMetadata& val) {
-    const auto& [change, meta] = val;
-    absl::StrAppend(&result, AclCatToString(change, meta.sign), " ");
-  };
-
-  auto cmd_visitor = [&result, this](const CommandAndMetadata& val) {
-    const auto& [change, meta] = val;
-    const auto [family, bit_index] = change;
-    absl::StrAppend(&result, AclCommandToString(family, bit_index, meta.sign), " ");
-  };
-
-  Overloaded visitor{cat_visitor, cmd_visitor};
-
-  for (auto change : tables) {
-    std::visit(visitor, change);
-  }
-
-  if (!result.empty()) {
-    result.pop_back();
-  }
-
-  return result;
+string AclFamily::UserToString(string_view username, const User& user, bool file_format) const {
+  string_view status =
+      user.IsActive() ? (file_format ? "ON" : "on") : (file_format ? "OFF" : "off");
+  const string keys = KeysToString(user.Keys());
+  return absl::StrCat(file_format ? "USER " : "user ", username, " ", status, " ",
+                      PasswordsToString(user, file_format), keys, keys.empty() ? "" : " ",
+                      ChannelsToString(user.PubSub()), " ", CommandRulesToString(user), " $",
+                      DbToString(user.Db()));
 }
 
-using OptCat = std::optional<uint32_t>;
+string AclFamily::CommandRulesToString(const User& user) const {
+  vector<pair<size_t, string>> rules;  // (seq_no, rule)
+  rules.reserve(user.CatChanges().size() + user.CmdChanges().size());
+  for (const auto& [category, meta] : user.CatChanges())
+    rules.emplace_back(meta.seq_no, CategoryRuleToString(category, meta.sign));
+  for (const auto& [command, meta] : user.CmdChanges())
+    rules.emplace_back(meta.seq_no, CommandRuleToString(command, meta.sign));
 
-// bool == true if +
-// bool == false if -
-std::pair<OptCat, bool> AclFamily::MaybeParseAclCategory(std::string_view command) const {
-  if (absl::EqualsIgnoreCase(command, "ALLCOMMANDS")) {
-    return {ALL, true};
-  }
-
-  if (absl::EqualsIgnoreCase(command, "NOCOMMANDS")) {
-    return {ALL, false};
-  }
-
-  if (absl::StartsWith(command, "+@")) {
-    return {ParseCategoryName(command.substr(2)), true};
-  }
-
-  if (absl::StartsWith(command, "-@")) {
-    return {ParseCategoryName(command.substr(2)), false};
-  }
-
-  return {};
+  rng::sort(rules);
+  return absl::StrJoin(rules, " ", [](string* out, const auto& rule) { out->append(rule.second); });
 }
 
-User::UpdateRequest::CategoryValueType AclFamily::CategoryRule(User::Sign sign,
-                                                               uint32_t category) const {
+string AclFamily::CommandRuleToString(User::CommandChange cmd, Sign sign) const {
+  const auto [family, mask] = cmd;
+
+  // A +name rule also sets the bits of name's ACL-only subcommands, registered after name.
+  string name = absl::AsciiStrToLower(family_commands_[family][absl::countr_zero(mask)]);
+  rng::replace(name, ' ', '|');  // One token in the ACL file.
+  return absl::StrCat(SignPrefix(sign), name);
+}
+
+User::UpdateRequest::CategoryValueType AclFamily::CategoryRule(Sign sign, uint32_t category) const {
   if (category == ALL)
-    return {sign, ALL, std::vector<uint64_t>(NumberOfFamilies(), ALL_COMMANDS)};
+    return {sign, ALL, vector<uint64_t>(NumberOfFamilies(), ALL_COMMANDS)};
   return {sign, category, category_commands_[absl::countr_zero(category)]};
 }
 
-std::optional<std::string> AclFamily::MaybeParseNamespace(std::string_view command) const {
-  constexpr std::string_view kPrefix = "NAMESPACE:";
-  if (absl::StartsWith(command, kPrefix)) {
-    return std::string(command.substr(kPrefix.size()));
-  }
-  return std::nullopt;
-}
+optional<User::UpdateRequest::CommandsValueType> AclFamily::ParseCommandRule(
+    string_view rule) const {
+  if (rule.empty() || (rule[0] != '+' && rule[0] != '-'))
+    return nullopt;
 
-std::pair<AclFamily::OptCommand, bool> AclFamily::MaybeParseAclCommand(
-    std::string_view command) const {
   // "cmd|sub" names a subcommand, the form ACL SAVE writes.
-  auto find = [this](std::string_view rule) {
-    std::string name{rule.substr(1)};
-    std::replace(name.begin(), name.end(), '|', ' ');
-    return cmd_registry_->Find(name);
-  };
+  string name{rule.substr(1)};
+  rng::replace(name, '|', ' ');
+  const CommandId* cid = cmd_registry_->Find(name);
+  if (!cid || cid->IsAlias())
+    return nullopt;
 
-  if (absl::StartsWith(command, "+")) {
-    auto res = find(command);
-    if (!res || res->IsAlias()) {
-      return {};
-    }
-    std::pair<size_t, uint64_t> cmd{res->GetFamily(), res->AclRuleMask()};
-    return {cmd, true};
-  }
-
-  if (absl::StartsWith(command, "-")) {
-    auto res = find(command);
-    if (!res || res->IsAlias()) {
-      return {};
-    }
-    std::pair<size_t, uint64_t> cmd{res->GetFamily(), res->AclRuleMask()};
-    return {cmd, false};
-  }
-
-  return {};
+  const Sign sign = rule[0] == '+' ? Sign::PLUS : Sign::MINUS;
+  return User::UpdateRequest::CommandsValueType{sign, cid->GetFamily(), cid->AclRuleMask()};
 }
 
-using facade::ErrorReply;
-
-std::variant<User::UpdateRequest, ErrorReply> AclFamily::ParseAclSetUser(
-    facade::ParsedArgs args, bool hashed, bool has_all_keys, bool has_all_channels) const {
+variant<User::UpdateRequest, ErrorReply> AclFamily::ParseAclSetUser(facade::ParsedArgs args,
+                                                                    bool hashed,
+                                                                    bool has_all_keys) const {
   User::UpdateRequest req;
 
-  for (std::string_view arg : args) {
-    if (auto pass = MaybeParsePassword(facade::ToSV(arg), hashed); pass) {
+  for (string_view arg : args) {
+    if (auto pass = ParsePasswordRule(arg, hashed); pass) {
       req.passwords.push_back(std::move(*pass));
-
-      if (hashed && absl::StartsWith(facade::ToSV(arg), "#")) {
-        req.passwords.back().is_hashed = true;
-      }
       continue;
     }
 
-    if (auto res = MaybeParseAclKey(facade::ToSV(arg)); res) {
-      auto& [glob, op, all_keys, reset_keys] = *res;
-      if ((has_all_keys && !all_keys && !reset_keys) ||
-          (req.allow_all_keys && !all_keys && !reset_keys)) {
+    if (auto key = ParseKeyRule(arg); key) {
+      const bool is_pattern = !key->all_keys && !key->reset_keys;
+      if (is_pattern && (has_all_keys || req.allow_all_keys)) {
         // The pattern may be a password given without '>'.
         return ErrorReply(
             "Error in ACL SETUSER modifier: Adding a pattern after the * pattern (or the "
@@ -1103,19 +891,17 @@ std::variant<User::UpdateRequest, ErrorReply> AclFamily::ParseAclSetUser(
             "with an empty list of patterns");
       }
 
-      req.allow_all_keys = all_keys;
-      req.reset_all_keys = reset_keys;
-      if (reset_keys) {
+      req.allow_all_keys = key->all_keys;
+      req.reset_all_keys = key->reset_keys;
+      if (key->reset_keys)
         has_all_keys = false;
-      }
-      req.keys.push_back({std::move(glob), op, all_keys, reset_keys});
+      req.keys.push_back(std::move(*key));
       continue;
     }
 
-    if (auto res = MaybeParseAclPubSub(facade::ToSV(arg)); res) {
-      auto& [glob, has_asterisk, all_channels, reset_channels] = *res;
-      if ((has_all_channels && !all_channels && !reset_channels) ||
-          (req.all_channels && !all_channels && !reset_channels)) {
+    if (auto channel = ParseChannelRule(arg); channel) {
+      const bool is_pattern = !channel->all_channels && !channel->reset_channels;
+      if (is_pattern && req.all_channels) {
         // The pattern may be a password given without '>'.
         return ErrorReply(
             "ERR Error in ACL SETUSER modifier: Adding a pattern after the * pattern (or the "
@@ -1123,60 +909,47 @@ std::variant<User::UpdateRequest, ErrorReply> AclFamily::ParseAclSetUser(
             "start with an empty list of channels");
       }
 
-      req.all_channels = all_channels;
-      req.reset_channels = reset_channels;
-      if (reset_channels) {
-        has_all_channels = false;
-      }
-      req.pub_sub.push_back({std::move(glob), has_asterisk, all_channels, reset_channels});
+      req.all_channels = channel->all_channels;
+      req.reset_channels = channel->reset_channels;
+      req.pub_sub.push_back(std::move(*channel));
       continue;
     }
 
-    if (auto res = MaybeParseAclDflySelect(facade::ToSV(arg), dbnum_); res) {
-      if (req.select_db) {
+    if (auto db = ParseDbRule(arg, dbnum_); db) {
+      if (req.select_db)
         return ErrorReply("ERR Error, select db $ was used twice");
-      }
+
       // AUTH switches the connection to this db, bypassing the SELECT restriction.
-      if (IsClusterEnabled() && *res != 0 && *res != std::numeric_limits<size_t>::max()) {
+      if (IsClusterEnabled() && *db != 0 && *db != kAllDbs)
         return ErrorReply("ERR Error, select db $ is not allowed in cluster mode");
-      }
-      req.select_db = res;
+      req.select_db = db;
       continue;
     }
 
-    std::string command = absl::AsciiStrToUpper(arg);
-
-    if (auto status = MaybeParseStatus(command); status) {
-      if (req.is_active) {
+    string rule = absl::AsciiStrToUpper(arg);
+    if (auto status = ParseStatusRule(rule); status) {
+      if (req.is_active)
         return ErrorReply("Multiple ON/OFF are not allowed");
-      }
       req.is_active = *status;
       continue;
     }
 
-    auto [cat, add] = MaybeParseAclCategory(command);
-    if (cat) {
-      req.updates.push_back(CategoryRule(add ? User::Sign::PLUS : User::Sign::MINUS, *cat));
+    if (auto category = ParseCategoryRule(rule); category) {
+      req.updates.push_back(CategoryRule(category->first, category->second));
       continue;
     }
 
-    auto ns = MaybeParseNamespace(command);
-    if (ns.has_value()) {
-      req.ns = *ns;
+    if (string_view ns = rule; absl::ConsumePrefix(&ns, "NAMESPACE:")) {
+      req.ns = string(ns);
       continue;
     }
 
-    auto [cmd, sign] = MaybeParseAclCommand(command);
-    if (!cmd) {
+    auto command = ParseCommandRule(rule);
+    if (!command) {
       // The token may be a password given without '>'.
       return ErrorReply("Unrecognized parameter");
     }
-
-    using Sign = User::Sign;
-    using Val = User::UpdateRequest::CommandsValueType;
-    auto [index, bit] = *cmd;
-    auto val = sign ? Val{Sign::PLUS, index, bit} : Val{Sign::MINUS, index, bit};
-    req.updates.push_back(val);
+    req.updates.push_back(*command);
   }
 
   return req;
