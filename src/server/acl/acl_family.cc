@@ -427,8 +427,12 @@ GenericError AclFamily::ParseAclFile(string_view path, UserRequests* requests) c
 }
 
 void AclFamily::AddUsers(UserRequests requests, UserRegistry::RegistryType* registry) {
-  for (auto& [username, req] : requests)
+  for (auto& [username, req] : requests) {
+    // Each record starts without commands, also when the file repeats a username.
+    if (registry->contains(username))
+      req.updates.insert(req.updates.begin(), CategoryRule(Sign::MINUS, ALL));
     UpsertUser(username, std::move(req), registry);
+  }
 
   if (!registry->contains("default")) {
     auto& user = (*registry)["default"];
